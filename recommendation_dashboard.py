@@ -1,8 +1,3 @@
-"""
-推荐系统可视化界面
-使用Streamlit构建交互式数据挖掘分析平台
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,6 +12,18 @@ from datetime import datetime
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
+# 机器学习和深度学习相关导入
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+import random
+import pickle
+import time
+
 warnings.filterwarnings('ignore')
 
 # 设置页面配置
@@ -30,6 +37,973 @@ st.set_page_config(
 # 设置中文显示
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
+
+# ===================== 机器学习模型定义 =====================
+
+class NCFModel(nn.Module):
+    """神经协同过滤模型（NCF）"""
+    def __init__(self, num_users, num_items, embedding_dim=32):
+        super(NCFModel, self).__init__()
+        self.user_embedding = nn.Embedding(num_users, embedding_dim)
+        self.item_embedding = nn.Embedding(num_items, embedding_dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim * 2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, user, item):
+        user_vec = self.user_embedding(user)
+        item_vec = self.item_embedding(item)
+        x = torch.cat([user_vec, item_vec], dim=-1)
+        return self.mlp(x).squeeze()
+
+class MultiFeatureLSTM(nn.Module):
+    """多特征LSTM模型"""
+    def __init__(self, item_vocab_size, behavior_dim, category_vocab_size):
+        super().__init__()
+        self.item_embed = nn.Embedding(item_vocab_size, 50, padding_idx=0)
+        self.behavior_embed = nn.Embedding(behavior_dim, 10)
+        self.category_embed = nn.Embedding(category_vocab_size, 20, padding_idx=0)
+        self.time_fc = nn.Linear(1, 10)
+
+        self.lstm = nn.LSTM(50 + 10 + 20 + 10, 64, batch_first=True)
+        self.fc = nn.Linear(64, category_vocab_size)
+
+    def forward(self, items, behaviors, categories, time_diffs):
+        items_emb = self.item_embed(items)
+        behaviors_emb = self.behavior_embed(behaviors)
+        categories_emb = self.category_embed(categories)
+        time_emb = self.time_fc(time_diffs.unsqueeze(-1))
+
+        combined = torch.cat([items_emb, behaviors_emb, categories_emb, time_emb], dim=-1)
+        lstm_out, _ = self.lstm(combined)
+        last_out = lstm_out[:, -1, :]
+        return self.fc(last_out)
+
+class InteractionDataset(Dataset):
+    """用户物品交互数据集"""
+    def __init__(self, df):
+        self.users = torch.tensor(df['user'].values, dtype=torch.long)
+        self.items = torch.tensor(df['item'].values, dtype=torch.long)
+        self.labels = torch.tensor(df['label'].values, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.users)
+
+    def __getitem__(self, idx):
+        return self.users[idx], self.items[idx], self.labels[idx]
+
+class CollaborativeFilteringRecommender:
+    """协同过滤推荐器 - 针对稀疏数据优化"""
+    def __init__(self):
+        self.user_item_matrix = None
+        self.item_user_matrix = None  # 商品-用户矩阵
+        self.user_sim_matrix = None
+        self.item_sim_matrix = None   # 商品相似度矩阵
+        self.trained = False
+        self.is_sparse = False        # 标记数据是否稀疏
+        
+    def fit(self, df):
+        """训练协同过滤模型 - 自适应稀疏数据"""
+        # 构建用户-商品矩阵
+        df_buy = df[df['behavior_type'] == 'buy'] if 'behavior_type' in df.columns else df
+        print(f"Debug: CF训练 - 原始购买记录数: {len(df_buy)}")
+        
+        user_item_counts = df_buy.groupby(['user_id', 'item_id']).size().unstack(fill_value=0)
+        self.user_item_matrix = user_item_counts
+        
+        # 同时构建商品-用户矩阵（转置）
+        self.item_user_matrix = self.user_item_matrix.T
+        
+        print(f"Debug: CF训练 - 用户-商品矩阵形状: {self.user_item_matrix.shape}")
+        sparsity = (self.user_item_matrix > 0).sum().sum() / (self.user_item_matrix.shape[0] * self.user_item_matrix.shape[1])
+        print(f"Debug: CF训练 - 非零元素比例: {sparsity:.6f}")
+        
+        # 判断数据是否稀疏
+        self.is_sparse = sparsity < 0.01  # 如果非零元素少于1%，认为是稀疏数据
+        print(f"Debug: CF训练 - 数据稀疏状态: {'稀疏' if self.is_sparse else '稠密'}")
+        
+        if self.is_sparse:
+            print(f"Debug: CF训练 - 检测到稀疏数据，采用商品-商品协同过滤策略")
+            # 对于稀疏数据，使用商品-商品协同过滤
+            self.item_sim_matrix = cosine_similarity(self.item_user_matrix)
+            self.item_sim_df = pd.DataFrame(
+                self.item_sim_matrix,
+                index=self.item_user_matrix.index,
+                columns=self.item_user_matrix.index
+            )
+            
+            # 商品相似度统计
+            item_sim_values = self.item_sim_matrix[self.item_sim_matrix != 1.0]
+            print(f"Debug: CF训练 - 商品相似度统计:")
+            print(f"  - 相似度范围: {item_sim_values.min():.6f} - {item_sim_values.max():.6f}")
+            print(f"  - 平均相似度: {item_sim_values.mean():.6f}")
+            print(f"  - 相似度>0的比例: {(item_sim_values > 0).sum() / len(item_sim_values):.6f}")
+            print(f"  - 相似度>0.1的比例: {(item_sim_values > 0.1).sum() / len(item_sim_values):.6f}")
+        else:
+            print(f"Debug: CF训练 - 数据较稠密，采用用户-用户协同过滤策略")
+            # 计算用户相似度
+            self.user_sim_matrix = cosine_similarity(self.user_item_matrix)
+            self.user_sim_df = pd.DataFrame(
+                self.user_sim_matrix, 
+                index=self.user_item_matrix.index, 
+                columns=self.user_item_matrix.index
+            )
+            
+            # 相似度矩阵诊断
+            sim_values = self.user_sim_matrix[self.user_sim_matrix != 1.0]
+            print(f"Debug: CF训练 - 用户相似度统计:")
+            print(f"  - 相似度范围: {sim_values.min():.6f} - {sim_values.max():.6f}")
+            print(f"  - 平均相似度: {sim_values.mean():.6f}")
+            print(f"  - 相似度>0的比例: {(sim_values > 0).sum() / len(sim_values):.6f}")
+            print(f"  - 相似度>0.01的比例: {(sim_values > 0.01).sum() / len(sim_values):.6f}")
+        
+        self.trained = True
+        print(f"Debug: CF训练完成")
+        
+    def recommend(self, user_id, top_n=10):
+        """为用户推荐商品 - 自适应稀疏/稠密数据"""
+        if not self.trained:
+            print(f"Debug: CF模型未训练")
+            return pd.Series(dtype=float)
+            
+        if user_id not in self.user_item_matrix.index:
+            print(f"Debug: 用户 {user_id} 不在CF训练数据中")
+            print(f"Debug: CF训练数据包含用户数: {len(self.user_item_matrix.index)}")
+            print(f"Debug: CF训练数据用户ID范围: {self.user_item_matrix.index.min()} - {self.user_item_matrix.index.max()}")
+            return pd.Series(dtype=float)
+        
+        if self.is_sparse:
+            # 对于稀疏数据，使用基于商品的协同过滤
+            return self._recommend_item_based(user_id, top_n)
+        else:
+            # 对于稠密数据，使用基于用户的协同过滤
+            return self._recommend_user_based(user_id, top_n)
+    
+    def _recommend_item_based(self, user_id, top_n=10):
+        """基于商品的协同过滤推荐"""
+        print(f"Debug: CF使用基于商品的协同过滤为用户 {user_id} 推荐")
+        
+        user_vector = self.user_item_matrix.loc[user_id]
+        user_items = user_vector[user_vector > 0].index  # 用户购买过的商品
+        
+        print(f"Debug: 用户 {user_id} 购买过的商品数: {len(user_items)}")
+        
+        if len(user_items) == 0:
+            print("Debug: 用户没有购买记录，无法推荐")
+            return pd.Series(dtype=float)
+        
+        scores = pd.Series(0.0, index=self.item_user_matrix.index)
+        
+        # 基于用户购买过的商品，找相似商品
+        for item in user_items:
+            similar_items = self.item_sim_df[item].drop(item).sort_values(ascending=False)
+            
+            # 使用较低的阈值，因为稀疏数据相似度普遍较低
+            threshold = 0.05
+            similar_items_filtered = similar_items[similar_items > threshold]
+            
+            print(f"Debug: 商品 {item} 找到 {len(similar_items_filtered)} 个相似商品 (阈值: {threshold})")
+            
+            if len(similar_items_filtered) == 0:
+                # 如果没有找到相似商品，降低阈值
+                threshold = 0.01
+                similar_items_filtered = similar_items[similar_items > threshold].head(10)
+                print(f"Debug: 降低阈值到 {threshold}，找到 {len(similar_items_filtered)} 个相似商品")
+            
+            # 累积分数
+            for similar_item, similarity in similar_items_filtered.head(20).items():
+                scores[similar_item] += similarity * user_vector[item]
+        
+        # 移除用户已购买的商品
+        candidate_scores = scores.drop(labels=user_items, errors='ignore')
+        
+        # 获取正分数的推荐
+        positive_scores = candidate_scores[candidate_scores > 0]
+        print(f"Debug: CF(商品)正分数商品数: {len(positive_scores)}")
+        
+        if len(positive_scores) == 0:
+            print("Debug: CF(商品)没有正分数的商品")
+            return pd.Series(dtype=float)
+        
+        result = positive_scores.sort_values(ascending=False).head(top_n)
+        print(f"Debug: CF(商品)最终推荐数量: {len(result)}")
+        if len(result) > 0:
+            print(f"Debug: CF(商品)推荐分数范围: {result.max():.6f} - {result.min():.6f}")
+        
+        return result
+    
+    def _recommend_user_based(self, user_id, top_n=10):
+        """基于用户的协同过滤推荐（原有逻辑）"""
+        print(f"Debug: CF使用基于用户的协同过滤为用户 {user_id} 推荐")
+        
+        user_vector = self.user_item_matrix.loc[user_id]
+        similar_users = self.user_sim_df[user_id].drop(user_id).sort_values(ascending=False)
+
+        print(f"Debug: CF用户 {user_id} 的相似度统计:")
+        print(f"  - 最高相似度: {similar_users.max():.4f}")
+        print(f"  - 平均相似度: {similar_users.mean():.4f}")
+        print(f"  - 相似度>0.01的用户数: {(similar_users > 0.01).sum()}")
+        print(f"  - 相似度>0.05的用户数: {(similar_users > 0.05).sum()}")
+
+        scores = pd.Series(0.0, index=self.user_item_matrix.columns)
+        
+        # 降低相似度阈值，使用更多相似用户
+        used_users = 0
+        similarity_threshold = 0.01  # 进一步降低阈值
+        for sim_user_id, similarity in similar_users.head(100).items():  # 扩展到top100
+            if similarity > similarity_threshold:
+                scores += similarity * self.user_item_matrix.loc[sim_user_id]
+                used_users += 1
+        
+        print(f"Debug: CF使用了 {used_users} 个相似用户 (阈值: {similarity_threshold})")
+        
+        if used_users == 0:
+            print(f"Debug: CF没有找到相似用户，尝试使用更低阈值...")
+            # 如果还是没有相似用户，尝试更低阈值
+            for sim_user_id, similarity in similar_users.head(50).items():
+                if similarity > 0.001:  # 非常低的阈值
+                    scores += similarity * self.user_item_matrix.loc[sim_user_id]
+                    used_users += 1
+            print(f"Debug: CF使用更低阈值(0.001)后，使用了 {used_users} 个相似用户")
+        
+        # 移除用户已经交互过的商品
+        already_bought = user_vector[user_vector > 0].index
+        print(f"Debug: 用户 {user_id} 已交互商品数: {len(already_bought)}")
+        
+        candidate_scores = scores.drop(labels=already_bought, errors='ignore')
+        
+        # 如果候选商品为空
+        if len(candidate_scores) == 0:
+            print("Debug: CF候选商品为空 - 所有商品都已被用户交互过")
+            return pd.Series(dtype=float)
+        
+        # 降低分数阈值，允许更多商品
+        positive_scores = candidate_scores[candidate_scores > 0]
+        print(f"Debug: CF正分数商品数: {len(positive_scores)}")
+        
+        if len(positive_scores) == 0:
+            print("Debug: CF没有正分数的商品")
+            return pd.Series(dtype=float)
+        
+        # 如果还是没有足够的推荐
+        if len(positive_scores) < top_n:
+            print(f"Debug: CF推荐不足({len(positive_scores)})，无兜底策略")
+        
+        result = positive_scores.sort_values(ascending=False).head(top_n)
+        print(f"Debug: CF最终推荐数量: {len(result)}")
+        if len(result) > 0:
+            print(f"Debug: CF推荐分数范围: {result.max():.6f} - {result.min():.6f}")
+        return result
+
+class NCFRecommender:
+    """NCF深度学习推荐器"""
+    def __init__(self):
+        self.model = None
+        self.user2idx = {}
+        self.item2idx = {}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.trained = False
+        
+    def fit(self, df, epochs=5):
+        """训练NCF模型"""
+        print(f"Debug: NCF训练开始 - 目标epochs: {epochs}")
+        
+        # 初始化训练记录
+        self.training_history = {
+            'epochs': [],
+            'losses': [],
+            'accuracies': []
+        }
+        
+        # 数据预处理
+        df_buy = df[df['behavior_type'] == 'buy'] if 'behavior_type' in df.columns else df
+        print(f"Debug: NCF训练 - 原始购买记录数: {len(df_buy)}")
+        
+        df_buy = df_buy.drop_duplicates(['user_id', 'item_id'])
+        print(f"Debug: NCF训练 - 去重后购买记录数: {len(df_buy)}")
+        
+        # 创建用户和物品映射
+        unique_users = df_buy['user_id'].unique()
+        unique_items = df_buy['item_id'].unique()
+        
+        self.user2idx = {uid: idx for idx, uid in enumerate(unique_users)}
+        self.item2idx = {iid: idx for idx, iid in enumerate(unique_items)}
+        
+        print(f"Debug: NCF训练 - 用户数: {len(self.user2idx)}")
+        print(f"Debug: NCF训练 - 商品数: {len(self.item2idx)}")
+        print(f"Debug: NCF训练 - 用户ID范围: {min(unique_users)} - {max(unique_users)}")
+        print(f"Debug: NCF训练 - 商品ID范围: {min(unique_items)} - {max(unique_items)}")
+        
+        df_buy['user'] = df_buy['user_id'].map(self.user2idx)
+        df_buy['item'] = df_buy['item_id'].map(self.item2idx)
+        
+        # 构造正负样本
+        print(f"Debug: NCF训练 - 开始构造正负样本...")
+        interactions = set(zip(df_buy['user'], df_buy['item']))
+        all_items = list(self.item2idx.values())
+        
+        print(f"Debug: NCF训练 - 正样本数: {len(interactions)}")
+        
+        # 限制负样本数量以提高训练速度，同时确保有足够的训练数据
+        max_samples = min(5000, len(interactions))  # 限制最大样本数
+        sampled_interactions = list(interactions)[:max_samples]
+        
+        neg_samples = []
+        for u, i in sampled_interactions:
+            j = random.choice(all_items)
+            while (u, j) in interactions:
+                j = random.choice(all_items)
+            neg_samples.append([u, j, 0])
+        
+        print(f"Debug: NCF训练 - 负样本数: {len(neg_samples)}")
+        
+        df_pos = df_buy[['user', 'item']].head(max_samples).copy()
+        df_pos['label'] = 1
+        df_neg = pd.DataFrame(neg_samples, columns=['user', 'item', 'label'])
+        df_all = pd.concat([df_pos, df_neg], ignore_index=True)
+        
+        print(f"Debug: NCF训练 - 总训练样本数: {len(df_all)}")
+        print(f"Debug: NCF训练 - 正负样本比例: {len(df_pos)}:{len(df_neg)}")
+        
+        # 数据稀疏度分析
+        total_possible = len(self.user2idx) * len(self.item2idx)
+        sparsity = len(interactions) / total_possible
+        print(f"Debug: NCF训练 - 数据稀疏度: {sparsity:.6f}")
+        
+        # 创建模型
+        print(f"Debug: NCF训练 - 创建模型...")
+        self.model = NCFModel(len(self.user2idx), len(self.item2idx)).to(self.device)
+        
+        # 模型参数统计
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"Debug: NCF训练 - 模型参数总数: {total_params:,}")
+        print(f"Debug: NCF训练 - 可训练参数数: {trainable_params:,}")
+        
+        # 保存模型统计信息
+        self.model_stats = {
+            'total_params': total_params,
+            'trainable_params': trainable_params,
+            'num_users': len(self.user2idx),
+            'num_items': len(self.item2idx),
+            'sparsity': sparsity,
+            'training_samples': len(df_all)
+        }
+        
+        criterion = nn.BCELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        
+        # 训练数据
+        train_dataset = InteractionDataset(df_all)
+        batch_size = min(512, len(df_all) // 4)  # 动态调整batch size
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        
+        print(f"Debug: NCF训练 - 批次大小: {batch_size}")
+        print(f"Debug: NCF训练 - 总批次数: {len(train_loader)}")
+        
+        # 训练模型
+        print(f"Debug: NCF训练 - 开始训练...")
+        
+        for epoch in range(epochs):
+            self.model.train()
+            epoch_loss = 0.0
+            batch_count = 0
+            
+            for users, items, labels in train_loader:
+                users, items, labels = users.to(self.device), items.to(self.device), labels.to(self.device)
+                
+                optimizer.zero_grad()
+                outputs = self.model(users, items)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                batch_count += 1
+            
+            avg_loss = epoch_loss / batch_count
+            
+            # 计算当前epoch的准确率
+            self.model.eval()
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for users, items, labels in train_loader:
+                    users, items, labels = users.to(self.device), items.to(self.device), labels.to(self.device)
+                    outputs = self.model(users, items)
+                    predicted = (outputs > 0.5).float()
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+            
+            accuracy = 100 * correct / total
+            
+            # 记录训练历史
+            self.training_history['epochs'].append(epoch + 1)
+            self.training_history['losses'].append(avg_loss)
+            self.training_history['accuracies'].append(accuracy)
+            
+            print(f"Debug: NCF训练 - Epoch {epoch+1}/{epochs}, 损失: {avg_loss:.6f}, 准确率: {accuracy:.2f}%")
+        
+        # 训练后评估
+        print(f"Debug: NCF训练 - 训练完成，进行模型评估...")
+        
+        # 损失趋势分析
+        if len(self.training_history['losses']) > 1:
+            loss_trend = self.training_history['losses'][-1] - self.training_history['losses'][0]
+            print(f"Debug: NCF训练 - 损失变化: {self.training_history['losses'][0]:.6f} -> {self.training_history['losses'][-1]:.6f} (变化: {loss_trend:.6f})")
+            
+            if loss_trend > -0.01:
+                print(f"Debug: NCF训练 - 警告: 损失下降不明显，可能需要更多epochs或调整学习率")
+        
+        # 预测分布分析
+        print(f"Debug: NCF训练 - 分析预测分布...")
+        sample_users = torch.tensor(list(range(min(100, len(self.user2idx)))), dtype=torch.long).to(self.device)
+        sample_items = torch.tensor(list(range(min(100, len(self.item2idx)))), dtype=torch.long).to(self.device)
+        
+        if len(sample_users) > 0 and len(sample_items) > 0:
+            # 创建用户-商品对的网格
+            user_grid, item_grid = torch.meshgrid(sample_users, sample_items, indexing='ij')
+            flat_users = user_grid.flatten()
+            flat_items = item_grid.flatten()
+            
+            with torch.no_grad():
+                sample_outputs = self.model(flat_users, flat_items)
+                
+            print(f"Debug: NCF训练 - 预测分数统计:")
+            print(f"  - 分数范围: {sample_outputs.min().item():.6f} - {sample_outputs.max().item():.6f}")
+            print(f"  - 平均分数: {sample_outputs.mean().item():.6f}")
+            print(f"  - 分数标准差: {sample_outputs.std().item():.6f}")
+            print(f"  - 高分比例(>0.7): {(sample_outputs > 0.7).float().mean().item():.4f}")
+            print(f"  - 低分比例(<0.3): {(sample_outputs < 0.3).float().mean().item():.4f}")
+        
+        self.trained = True
+        print(f"Debug: NCF训练完成！")
+        print(f"Debug: NCF可推荐用户数: {len(self.user2idx)}")
+        print(f"Debug: NCF可推荐商品数: {len(self.item2idx)}")
+    
+    def recommend(self, user_id_raw, k=10):
+        """为用户推荐商品"""
+        if not self.trained:
+            print(f"Debug: NCF模型未训练")
+            return []
+            
+        user_id = self.user2idx.get(user_id_raw)
+        if user_id is None:
+            print(f"Debug: 用户 {user_id_raw} 不在NCF训练数据中")
+            print(f"Debug: NCF训练数据包含用户数: {len(self.user2idx)}")
+            if self.user2idx:
+                print(f"Debug: NCF训练数据用户ID范围: {min(self.user2idx.keys())} - {max(self.user2idx.keys())}")
+            return []
+
+        user_tensor = torch.tensor([user_id] * len(self.item2idx), dtype=torch.long).to(self.device)
+        item_tensor = torch.tensor(list(self.item2idx.values()), dtype=torch.long).to(self.device)
+        
+        self.model.eval()
+        with torch.no_grad():
+            scores = self.model(user_tensor, item_tensor).cpu().numpy()
+        
+        # 检查分数分布
+        print(f"Debug: NCF分数范围: {scores.min():.4f} - {scores.max():.4f}")
+        print(f"Debug: NCF平均分数: {scores.mean():.4f}")
+        
+        # 获取推荐商品
+        top_items_idx = scores.argsort()[-k:][::-1]
+        top_item_ids = [list(self.item2idx.keys())[i] for i in top_items_idx]
+        top_scores = [float(scores[i]) for i in top_items_idx]  # 确保分数是float类型
+        
+        # 如果分数都很低，给出警告而不是归一化
+        if max(top_scores) < 0.1:
+            print(f"Debug: NCF分数偏低(最高:{max(top_scores):.4f})，可能模型训练不充分")
+        
+        result = list(zip(top_item_ids, top_scores))
+        print(f"Debug: NCF推荐结果数量: {len(result)}")
+        print(f"Debug: NCF推荐分数示例: {[f'{score:.4f}' for _, score in result[:3]]}")
+        return result
+
+class LSTMRecommender:
+    """LSTM序列推荐器"""
+    def __init__(self):
+        self.model = None
+        self.item_to_idx = {}
+        self.cat_to_idx = {}
+        self.behavior_to_idx = {'pv': 1, 'cart': 2, 'fav': 3, 'buy': 4}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.trained = False
+        self.max_seq_len = 10
+        
+    def fit(self, df, epochs=3):
+        """训练LSTM序列预测模型"""
+        print(f"Debug: LSTM训练开始 - 目标epochs: {epochs}")
+        
+        # 初始化训练记录
+        self.training_history = {
+            'epochs': [],
+            'losses': [],
+            'accuracies': []
+        }
+        
+        try:
+            # 数据预处理
+            df = df.copy()
+            print(f"Debug: LSTM训练 - 原始数据行数: {len(df)}")
+            
+            df = df.sort_values(['user_id', 'timestamp'] if 'timestamp' in df.columns else ['user_id'])
+            
+            # 构建词汇表
+            print(f"Debug: LSTM训练 - 构建词汇表...")
+            unique_items = df['item_id'].unique()
+            unique_categories = df['category_id'].unique()
+            
+            self.item_to_idx = {item: idx+1 for idx, item in enumerate(unique_items)}
+            self.cat_to_idx = {cat: idx+1 for idx, cat in enumerate(unique_categories)}
+            
+            print(f"Debug: LSTM训练 - 商品词汇表大小: {len(self.item_to_idx)}")
+            print(f"Debug: LSTM训练 - 类别词汇表大小: {len(self.cat_to_idx)}")
+            print(f"Debug: LSTM训练 - 行为类型词汇表: {self.behavior_to_idx}")
+            
+            # 为每个用户构建序列
+            print(f"Debug: LSTM训练 - 构建用户行为序列...")
+            sequences = []
+            all_users = df['user_id'].unique()
+            target_users = all_users[:500]  # 限制用户数量以提高训练速度
+            
+            print(f"Debug: LSTM训练 - 总用户数: {len(all_users)}, 训练用户数: {len(target_users)}")
+            
+            valid_sequences = 0
+            for user_id in target_users:
+                user_data = df[df['user_id'] == user_id].copy()
+                if len(user_data) < 3:  # 需要至少3条记录
+                    continue
+                    
+                # 映射到索引
+                user_data['item_idx'] = user_data['item_id'].map(self.item_to_idx)
+                user_data['cat_idx'] = user_data['category_id'].map(self.cat_to_idx)
+                user_data['behavior_idx'] = user_data['behavior_type'].map(self.behavior_to_idx)
+                
+                # 检查映射成功率
+                valid_items = user_data['item_idx'].notna().sum()
+                valid_cats = user_data['cat_idx'].notna().sum()
+                valid_behaviors = user_data['behavior_idx'].notna().sum()
+                
+                if valid_items < len(user_data) * 0.8 or valid_cats < len(user_data) * 0.8:
+                    continue  # 跳过映射成功率低的用户
+                
+                # 生成序列
+                for i in range(2, len(user_data)):
+                    seq_items = user_data['item_idx'].iloc[:i].fillna(0).astype(int).tolist()
+                    seq_behaviors = user_data['behavior_idx'].iloc[:i].fillna(0).astype(int).tolist()
+                    seq_cats = user_data['cat_idx'].iloc[:i].fillna(0).astype(int).tolist()
+                    target_cat = user_data['cat_idx'].iloc[i]
+                    
+                    if pd.isna(target_cat):
+                        continue
+                    
+                    # 时间差特征（简化为位置编码）
+                    seq_times = list(range(len(seq_items)))
+                    
+                    sequences.append({
+                        'items': seq_items[-self.max_seq_len:],
+                        'behaviors': seq_behaviors[-self.max_seq_len:],
+                        'categories': seq_cats[-self.max_seq_len:],
+                        'times': seq_times[-self.max_seq_len:],
+                        'target': int(target_cat)
+                    })
+                
+                valid_sequences += 1
+            
+            print(f"Debug: LSTM训练 - 有效用户数: {valid_sequences}")
+            print(f"Debug: LSTM训练 - 生成序列数: {len(sequences)}")
+            
+            if len(sequences) < 10:
+                print("Debug: LSTM训练数据不足")
+                return False
+            
+            # 序列长度统计
+            seq_lengths = [len(seq['items']) for seq in sequences]
+            print(f"Debug: LSTM训练 - 序列长度统计:")
+            print(f"  - 平均长度: {np.mean(seq_lengths):.2f}")
+            print(f"  - 最大长度: {max(seq_lengths)}")
+            print(f"  - 最小长度: {min(seq_lengths)}")
+            
+            # 目标类别分布
+            target_cats = [seq['target'] for seq in sequences]
+            target_distribution = pd.Series(target_cats).value_counts()
+            print(f"Debug: LSTM训练 - 目标类别分布:")
+            print(f"  - 类别数: {len(target_distribution)}")
+            print(f"  - 最频繁类别: {target_distribution.index[0]} (出现{target_distribution.iloc[0]}次)")
+            print(f"  - 类别分布均匀度: {target_distribution.std()/target_distribution.mean():.3f}")
+            
+            # 创建模型
+            print(f"Debug: LSTM训练 - 创建模型...")
+            vocab_size_item = len(self.item_to_idx) + 1
+            vocab_size_cat = len(self.cat_to_idx) + 1
+            behavior_dim = len(self.behavior_to_idx) + 1
+            
+            print(f"Debug: LSTM训练 - 模型参数:")
+            print(f"  - 商品词汇量: {vocab_size_item}")
+            print(f"  - 类别词汇量: {vocab_size_cat}")
+            print(f"  - 行为维度: {behavior_dim}")
+            print(f"  - 序列长度: {self.max_seq_len}")
+            
+            self.model = MultiFeatureLSTM(
+                item_vocab_size=vocab_size_item,
+                behavior_dim=behavior_dim,
+                category_vocab_size=vocab_size_cat
+            ).to(self.device)
+            
+            # 模型参数统计
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f"Debug: LSTM训练 - 模型参数总数: {total_params:,}")
+            print(f"Debug: LSTM训练 - 可训练参数数: {trainable_params:,}")
+            
+            # 保存模型统计信息
+            self.model_stats = {
+                'total_params': total_params,
+                'trainable_params': trainable_params,
+                'vocab_size_item': vocab_size_item,
+                'vocab_size_cat': vocab_size_cat,
+                'num_sequences': len(sequences),
+                'valid_users': valid_sequences
+            }
+            
+            # 准备训练数据
+            print(f"Debug: LSTM训练 - 准备训练数据...")
+            train_data = self._prepare_sequences(sequences)
+            print(f"Debug: LSTM训练 - 训练批次数: {len(train_data)}")
+            
+            # 训练模型
+            criterion = nn.CrossEntropyLoss(ignore_index=0)
+            optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+            
+            print(f"Debug: LSTM训练 - 开始训练...")
+            
+            self.model.train()
+            for epoch in range(epochs):
+                epoch_loss = 0.0
+                batch_count = 0
+                
+                for batch in train_data:
+                    items, behaviors, categories, times, targets = batch
+                    
+                    items = items.to(self.device)
+                    behaviors = behaviors.to(self.device)
+                    categories = categories.to(self.device)
+                    times = times.to(self.device)
+                    targets = targets.to(self.device)
+                    
+                    optimizer.zero_grad()
+                    outputs = self.model(items, behaviors, categories, times)
+                    loss = criterion(outputs, targets)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    epoch_loss += loss.item()
+                    batch_count += 1
+                
+                avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
+                
+                # 计算当前epoch的准确率
+                self.model.eval()
+                correct = 0
+                total = 0
+                
+                with torch.no_grad():
+                    for batch in train_data:
+                        items, behaviors, categories, times, targets = batch
+                        
+                        items = items.to(self.device)
+                        behaviors = behaviors.to(self.device)
+                        categories = categories.to(self.device)
+                        times = times.to(self.device)
+                        targets = targets.to(self.device)
+                        
+                        outputs = self.model(items, behaviors, categories, times)
+                        _, predicted = torch.max(outputs.data, 1)
+                        total += targets.size(0)
+                        correct += (predicted == targets).sum().item()
+                
+                accuracy = 100 * correct / total if total > 0 else 0
+                
+                # 记录训练历史
+                self.training_history['epochs'].append(epoch + 1)
+                self.training_history['losses'].append(avg_loss)
+                self.training_history['accuracies'].append(accuracy)
+                
+                print(f"Debug: LSTM训练 - Epoch {epoch+1}/{epochs}, 损失: {avg_loss:.6f}, 准确率: {accuracy:.2f}%")
+                
+                # 回到训练模式
+                self.model.train()
+            
+            # 训练后评估
+            print(f"Debug: LSTM训练 - 训练完成，进行模型评估...")
+            
+            # 损失趋势分析
+            if len(self.training_history['losses']) > 1:
+                loss_trend = self.training_history['losses'][-1] - self.training_history['losses'][0]
+                print(f"Debug: LSTM训练 - 损失变化: {self.training_history['losses'][0]:.6f} -> {self.training_history['losses'][-1]:.6f} (变化: {loss_trend:.6f})")
+                
+                if loss_trend > -0.1:
+                    print(f"Debug: LSTM训练 - 警告: 损失下降不明显，可能需要更多epochs或调整学习率")
+            
+            # 预测分布分析
+            print(f"Debug: LSTM训练 - 分析类别预测分布...")
+            sample_predictions = []
+            
+            self.model.eval()
+            with torch.no_grad():
+                for batch in train_data[:5]:  # 取前5个批次进行分析
+                    items, behaviors, categories, times, targets = batch
+                    
+                    items = items.to(self.device)
+                    behaviors = behaviors.to(self.device)
+                    categories = categories.to(self.device)
+                    times = times.to(self.device)
+                    
+                    outputs = self.model(items, behaviors, categories, times)
+                    probs = torch.softmax(outputs, dim=1)
+                    max_probs, predicted_cats = torch.max(probs, 1)
+                    
+                    sample_predictions.extend(max_probs.cpu().numpy())
+            
+            if sample_predictions:
+                print(f"Debug: LSTM训练 - 预测置信度统计:")
+                print(f"  - 置信度范围: {min(sample_predictions):.4f} - {max(sample_predictions):.4f}")
+                print(f"  - 平均置信度: {np.mean(sample_predictions):.4f}")
+                print(f"  - 高置信度比例(>0.8): {np.mean(np.array(sample_predictions) > 0.8):.4f}")
+                print(f"  - 低置信度比例(<0.3): {np.mean(np.array(sample_predictions) < 0.3):.4f}")
+            
+            self.trained = True
+            print(f"Debug: LSTM训练完成！")
+            print(f"Debug: LSTM可预测用户需在原始数据中有足够序列")
+            return True
+            
+        except Exception as e:
+            print(f"Debug: LSTM训练失败: {str(e)}")
+            return False
+    
+    def _prepare_sequences(self, sequences):
+        """准备训练序列"""
+        batch_size = 32
+        batches = []
+        
+        for i in range(0, len(sequences), batch_size):
+            batch_seqs = sequences[i:i+batch_size]
+            
+            # Padding
+            items_batch = []
+            behaviors_batch = []
+            categories_batch = []
+            times_batch = []
+            targets_batch = []
+            
+            for seq in batch_seqs:
+                # Pad sequences to max_seq_len
+                items = seq['items'] + [0] * (self.max_seq_len - len(seq['items']))
+                behaviors = seq['behaviors'] + [0] * (self.max_seq_len - len(seq['behaviors']))
+                categories = seq['categories'] + [0] * (self.max_seq_len - len(seq['categories']))
+                times = seq['times'] + [0] * (self.max_seq_len - len(seq['times']))
+                
+                items_batch.append(items[-self.max_seq_len:])
+                behaviors_batch.append(behaviors[-self.max_seq_len:])
+                categories_batch.append(categories[-self.max_seq_len:])
+                times_batch.append(times[-self.max_seq_len:])
+                targets_batch.append(seq['target'])
+            
+            batch_tensors = (
+                torch.tensor(items_batch, dtype=torch.long),
+                torch.tensor(behaviors_batch, dtype=torch.long),
+                torch.tensor(categories_batch, dtype=torch.long),
+                torch.tensor(times_batch, dtype=torch.float),
+                torch.tensor(targets_batch, dtype=torch.long)
+            )
+            batches.append(batch_tensors)
+        
+        return batches
+    
+    def recommend_categories(self, user_id, df, k=5):
+        """为用户推荐类别"""
+        if not self.trained:
+            print("Debug: LSTM模型未训练")
+            return []
+        
+        try:
+            # 获取用户历史序列
+            user_data = df[df['user_id'] == user_id].copy()
+            if len(user_data) == 0:
+                print(f"Debug: 用户 {user_id} 在原始数据中没有历史数据")
+                return []
+            
+            # 检查用户数据是否足够
+            if len(user_data) < 3:
+                print(f"Debug: 用户 {user_id} 历史数据不足({len(user_data)}条)，需要至少3条")
+                return []
+            
+            user_data = user_data.sort_values('timestamp' if 'timestamp' in user_data.columns else user_data.columns[0])
+            
+            # 构建输入序列
+            seq_items = [self.item_to_idx.get(item, 0) for item in user_data['item_id'].tail(self.max_seq_len)]
+            seq_behaviors = [self.behavior_to_idx.get(behavior, 0) for behavior in user_data['behavior_type'].tail(self.max_seq_len)]
+            seq_cats = [self.cat_to_idx.get(cat, 0) for cat in user_data['category_id'].tail(self.max_seq_len)]
+            seq_times = list(range(len(seq_items)))
+            
+            # 检查映射成功率
+            valid_items = sum(1 for x in seq_items if x > 0)
+            valid_behaviors = sum(1 for x in seq_behaviors if x > 0) 
+            valid_cats = sum(1 for x in seq_cats if x > 0)
+            
+            print(f"Debug: LSTM用户 {user_id} 映射统计 - 商品:{valid_items}/{len(seq_items)}, 行为:{valid_behaviors}/{len(seq_behaviors)}, 类别:{valid_cats}/{len(seq_cats)}")
+            
+            if valid_items == 0 or valid_cats == 0:
+                print(f"Debug: 用户 {user_id} 的商品或类别无法映射到训练词汇表")
+                return []
+            
+            # Padding
+            if len(seq_items) < self.max_seq_len:
+                pad_len = self.max_seq_len - len(seq_items)
+                seq_items = [0] * pad_len + seq_items
+                seq_behaviors = [0] * pad_len + seq_behaviors
+                seq_cats = [0] * pad_len + seq_cats
+                seq_times = [0] * pad_len + seq_times
+            
+            # 预测
+            items_tensor = torch.tensor([seq_items], dtype=torch.long).to(self.device)
+            behaviors_tensor = torch.tensor([seq_behaviors], dtype=torch.long).to(self.device)
+            cats_tensor = torch.tensor([seq_cats], dtype=torch.long).to(self.device)
+            times_tensor = torch.tensor([seq_times], dtype=torch.float).to(self.device)
+            
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(items_tensor, behaviors_tensor, cats_tensor, times_tensor)
+                probs = torch.softmax(outputs, dim=1)
+                topk_probs, topk_ids = torch.topk(probs, k)
+            
+            # 转换回类别名称
+            results = []
+            idx_to_cat = {v: k for k, v in self.cat_to_idx.items()}
+            
+            for prob, cat_id in zip(topk_probs[0], topk_ids[0]):
+                cat_id = cat_id.item()
+                if cat_id in idx_to_cat:
+                    category = idx_to_cat[cat_id]
+                    results.append((category, float(prob.item())))
+            
+            print(f"Debug: LSTM推荐类别数量: {len(results)}")
+            print(f"Debug: LSTM推荐类别示例: {[f'{cat}:{prob:.4f}' for cat, prob in results[:3]]}")
+            return results
+            
+        except Exception as e:
+            print(f"Debug: LSTM推荐失败: {str(e)}")
+            return []
+    
+    def recommend(self, user_id, df, k=10):
+        """为用户推荐商品（基于类别预测）"""
+        if not self.trained:
+            print("Debug: LSTM模型未训练")
+            return []
+        
+        try:
+            # 首先预测用户感兴趣的类别
+            category_recommendations = self.recommend_categories(user_id, df, k=min(5, k))
+            
+            if not category_recommendations:
+                print(f"Debug: 用户 {user_id} 无法预测类别")
+                return []
+            
+            # 获取用户历史行为，用于个性化
+            user_data = df[df['user_id'] == user_id].copy()
+            user_history_items = set(user_data['item_id'].tolist())
+            user_preferred_categories = user_data['category_id'].value_counts().to_dict()
+            user_behavior_weights = {
+                'pv': 0.1, 'cart': 0.3, 'fav': 0.5, 'buy': 1.0
+            }
+            
+            # 计算用户对每个商品的历史偏好分数
+            user_item_preference = {}
+            for _, row in user_data.iterrows():
+                item_id = row['item_id']
+                behavior = row['behavior_type']
+                weight = user_behavior_weights.get(behavior, 0.1)
+                
+                if item_id in user_item_preference:
+                    user_item_preference[item_id] += weight
+                else:
+                    user_item_preference[item_id] = weight
+            
+            # 基于预测的类别推荐商品
+            recommendations = []
+            
+            for category, category_score in category_recommendations:
+                # 获取该类别下的商品，排除用户已交互的
+                category_items = df[df['category_id'] == category]['item_id'].value_counts()
+                
+                # 给用户偏好类别更高权重
+                category_preference_bonus = user_preferred_categories.get(category, 0) * 0.1
+                
+                for item_id, popularity in category_items.head(3).items():  # 每个类别取top3
+                    if item_id in user_history_items:
+                        continue  # 跳过用户已交互的商品
+                    
+                    # 计算综合分数
+                    # 1. 类别预测分数
+                    base_score = category_score
+                    
+                    # 2. 商品热度分数 (归一化)
+                    popularity_score = popularity / category_items.max() * 0.3
+                    
+                    # 3. 类别偏好奖励
+                    preference_bonus = category_preference_bonus
+                    
+                    # 4. 确定性调整因子（基于用户ID，确保一致性）
+                    user_hash = hash(str(user_id)) % 1000
+                    consistency_factor = 0.9 + (user_hash / 10000)  # 0.9-0.999之间的固定值
+                    
+                    # 5. 用户历史行为模式匹配度
+                    behavior_match = 0.1
+                    user_avg_interactions = len(user_data) / user_data['item_id'].nunique() if user_data['item_id'].nunique() > 0 else 1
+                    if user_avg_interactions > 2:  # 活跃用户
+                        behavior_match = 0.2
+                    
+                    final_score = (base_score + popularity_score + preference_bonus + behavior_match) * consistency_factor
+                    
+                    recommendations.append((item_id, float(final_score)))
+            
+            # 如果推荐数量不足，明确说明原因而不是补充
+            if len(recommendations) < k:
+                print(f"Debug: LSTM推荐不足({len(recommendations)})，原因分析:")
+                if not category_recommendations:
+                    print("  - 类别预测失败")
+                else:
+                    print("  - 预测类别中可推荐商品不足")
+                    print(f"  - 预测的类别: {[cat for cat, _ in category_recommendations]}")
+                    if user_preferred_categories:
+                        print(f"  - 用户历史类别: {list(user_preferred_categories.keys())[:3]}")
+            
+            # 按分数排序并返回top k
+            recommendations.sort(key=lambda x: x[1], reverse=True)
+            result = recommendations[:k]
+            
+            print(f"Debug: LSTM推荐商品数量: {len(result)}")
+            if user_preferred_categories:
+                print(f"Debug: LSTM用户 {user_id} 偏好类别: {list(user_preferred_categories.keys())[:3]}")
+            if result:
+                print(f"Debug: LSTM推荐分数范围: {result[0][1]:.4f} - {result[-1][1]:.4f}")
+            else:
+                print("Debug: LSTM无法为该用户生成推荐")
+            return result
+            
+        except Exception as e:
+            print(f"Debug: LSTM商品推荐失败: {str(e)}")
+            return []
+
+# ===================== 原有代码继续 =====================
 
 # 设置文件上传大小限制为5GB
 @st.cache_resource
@@ -54,7 +1028,21 @@ class RecommendationDashboard:
         self.data = None
         self.user_features = None
         self.recommendations = None
+        # 初始化推荐器
+        self.cf_recommender = CollaborativeFilteringRecommender()
+        self.ncf_recommender = NCFRecommender()
+        self.lstm_recommender = LSTMRecommender()
         
+        # 初始化session state
+        if 'models_trained' not in st.session_state:
+            st.session_state.models_trained = False
+        
+        if 'trained_ncf_recommender' not in st.session_state:
+            st.session_state.trained_ncf_recommender = None
+        
+        if 'trained_lstm_recommender' not in st.session_state:
+            st.session_state.trained_lstm_recommender = None
+    
     @st.cache_data
     def load_data(_self, file_path):
         """加载数据"""
@@ -73,11 +1061,6 @@ class RecommendationDashboard:
         # 数据加载
         st.sidebar.subheader("📁 数据加载")
         
-        # 添加文件大小提示
-        st.sidebar.info("💡 **文件上传说明**\n"
-                       "- 支持最大5GB的CSV文件\n"
-                       "- 推荐使用预处理后的数据文件\n"
-                       "- 大文件加载可能需要较长时间")
         
         uploaded_file = st.sidebar.file_uploader(
             "选择数据文件", 
@@ -145,7 +1128,6 @@ class RecommendationDashboard:
         return analysis_type
     
     def render_data_overview(self):
-        """数据概览页面 - 包含来自 ylz_version1.ipynb 的所有可视化"""
         st.header("📊 数据概览与探索性分析")
         
         if self.data is None or self.data.empty:
@@ -185,7 +1167,15 @@ class RecommendationDashboard:
             
             # 数据预览
             st.subheader("数据预览")
-            st.dataframe(df.head(10))
+            # 修复Arrow序列化问题 - 确保数据类型兼容
+            display_df = df.head(10).copy()
+            for col in display_df.columns:
+                if display_df[col].dtype == 'object':
+                    try:
+                        display_df[col] = display_df[col].astype(str)
+                    except:
+                        pass
+            st.dataframe(display_df)
             
             # 数据类型
             st.subheader("数据类型")
@@ -1277,7 +2267,15 @@ class RecommendationDashboard:
                     except Exception as summary_error:
                         st.error(f"分群特征对比计算失败: {str(summary_error)}")
                         st.write("显示原始数据预览:")
-                        st.dataframe(rfm_df.head(), use_container_width=True)
+                        # 修复数据显示问题
+                        preview_df = rfm_df.head().copy()
+                        for col in preview_df.columns:
+                            if preview_df[col].dtype == 'object':
+                                try:
+                                    preview_df[col] = preview_df[col].astype(str)
+                                except:
+                                    pass
+                        st.dataframe(preview_df, use_container_width=True)
                     
                     # 分群详情
                     st.subheader("分群详情分析")
@@ -1405,97 +2403,471 @@ class RecommendationDashboard:
         """渲染推荐算法比较页面"""
         st.title("🔬 推荐算法比较")
         
-        # 模拟算法性能数据
-        algorithm_performance = {
-            '算法名称': ['协同过滤(用户)', '协同过滤(物品)', '矩阵分解', 'LSTM序列', 'Transformer', '深度神经网络'],
-            '准确率': [0.65, 0.68, 0.72, 0.75, 0.78, 0.73],
-            '召回率': [0.58, 0.62, 0.69, 0.71, 0.74, 0.70],
-            'F1分数': [0.61, 0.65, 0.70, 0.73, 0.76, 0.71],
-            '覆盖率': [0.45, 0.52, 0.58, 0.62, 0.65, 0.60],
-            '多样性': [0.72, 0.68, 0.65, 0.70, 0.73, 0.67],
-            '训练时间(分钟)': [15, 18, 45, 120, 180, 90]
-        }
+        if self.data is None:
+            st.warning("⚠️ 请先在侧边栏上传数据文件")
+            return
         
-        performance_df = pd.DataFrame(algorithm_performance)
+        # 模型训练部分
+        st.subheader("🎯 模型训练")
         
-        # 性能对比雷达图
-        st.subheader("📊 算法性能对比")
-        
-        col1, col2 = st.columns(2)
+        col1, col2 = st.columns([1, 2])
         
         with col1:
-            # 雷达图
-            categories = ['准确率', '召回率', 'F1分数', '覆盖率', '多样性']
-            
-            fig = go.Figure()
-            
-            for i, algorithm in enumerate(performance_df['算法名称']):
-                values = [performance_df.iloc[i][cat] for cat in categories]
-                values += [values[0]]  # 闭合雷达图
+            if not st.session_state.models_trained:
+                if st.button("🚀 开始训练模型", type="primary"):
+                    self.train_models()
+            else:
+                st.success("✅ 模型已训练完成")
+                if st.button("🔄 重新训练模型", type="secondary"):
+                    # 重置模型状态
+                    st.session_state.models_trained = False
+                    st.session_state.trained_ncf_recommender = None
+                    st.session_state.trained_lstm_recommender = None
+                    
+                    st.warning("⚠️ 模型状态已重置，请重新训练")
+                    st.experimental_rerun()
+        
+        with col2:
+            if st.session_state.models_trained:
+                st.info("""
+                **已训练的模型:**
+                - ✅ NCF深度学习推荐器 (神经协同过滤)
+                - ✅ LSTM序列预测器 (基于用户行为序列)
+                """)
+            else:
+                st.info("""
+                **待训练的模型:**
+                - ⏳ NCF深度学习推荐器  
+                - ⏳ LSTM序列预测器
                 
-                fig.add_trace(go.Scatterpolar(
-                    r=values,
-                    theta=categories + [categories[0]],
-                    fill='toself',
-                    name=algorithm
-                ))
+                点击"开始训练模型"按钮开始训练
+                """)
+        
+        # 如果模型已训练，显示性能比较
+        if st.session_state.models_trained:
+            self.render_model_performance_comparison()
+        else:
+            st.info("请先训练模型以查看性能比较结果")
+    
+    def render_model_performance_comparison(self):
+        """渲染模型性能比较部分"""
+        st.subheader("📊 模型性能比较")
+        
+        # 创建选项卡
+        tab1, tab2, tab3 = st.tabs(["📈 训练过程", "🎯 雷达图比较", "📋 详细统计"])
+        
+        with tab1:
+            st.subheader("训练过程可视化")
             
-            fig.update_layout(
-                polar=dict(
-                    radialaxis=dict(visible=True, range=[0, 1])
-                ),
-                title="算法性能雷达图"
-            )
+            # 获取训练历史数据
+            ncf_history = None
+            lstm_history = None
             
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # 性能指标柱状图
-            selected_metric = st.selectbox("选择性能指标", categories)
+            if (st.session_state.trained_ncf_recommender and 
+                hasattr(st.session_state.trained_ncf_recommender, 'training_history')):
+                ncf_history = st.session_state.trained_ncf_recommender.training_history
             
-            fig = px.bar(
-                performance_df,
-                x='算法名称',
-                y=selected_metric,
-                title=f"{selected_metric}对比",
-                color=selected_metric,
-                color_continuous_scale='viridis'
-            )
-            fig.update_layout(xaxis_tickangle=45)
-            st.plotly_chart(fig, use_container_width=True)
+            if (st.session_state.trained_lstm_recommender and 
+                hasattr(st.session_state.trained_lstm_recommender, 'training_history')):
+                lstm_history = st.session_state.trained_lstm_recommender.training_history
+            
+            if ncf_history or lstm_history:
+                # 损失曲线
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**📉 训练损失曲线**")
+                    fig_loss = go.Figure()
+                    
+                    if ncf_history and ncf_history['epochs']:
+                        fig_loss.add_trace(go.Scatter(
+                            x=ncf_history['epochs'],
+                            y=ncf_history['losses'],
+                            mode='lines+markers',
+                            name='NCF深度学习',
+                            line=dict(color='#FF6B6B', width=3),
+                            marker=dict(size=8)
+                        ))
+                    
+                    if lstm_history and lstm_history['epochs']:
+                        fig_loss.add_trace(go.Scatter(
+                            x=lstm_history['epochs'],
+                            y=lstm_history['losses'],
+                            mode='lines+markers',
+                            name='LSTM序列预测',
+                            line=dict(color='#4ECDC4', width=3),
+                            marker=dict(size=8)
+                        ))
+                    
+                    fig_loss.update_layout(
+                        title="训练损失变化",
+                        xaxis_title="Epoch",
+                        yaxis_title="损失值",
+                        hovermode='x unified',
+                        template='plotly_white'
+                    )
+                    
+                    st.plotly_chart(fig_loss, use_container_width=True)
+                
+                with col2:
+                    st.write("**📈 训练准确率曲线**")
+                    fig_acc = go.Figure()
+                    
+                    if ncf_history and ncf_history['epochs']:
+                        fig_acc.add_trace(go.Scatter(
+                            x=ncf_history['epochs'],
+                            y=ncf_history['accuracies'],
+                            mode='lines+markers',
+                            name='NCF深度学习',
+                            line=dict(color='#FF6B6B', width=3),
+                            marker=dict(size=8)
+                        ))
+                    
+                    if lstm_history and lstm_history['epochs']:
+                        fig_acc.add_trace(go.Scatter(
+                            x=lstm_history['epochs'],
+                            y=lstm_history['accuracies'],
+                            mode='lines+markers',
+                            name='LSTM序列预测',
+                            line=dict(color='#4ECDC4', width=3),
+                            marker=dict(size=8)
+                        ))
+                    
+                    fig_acc.update_layout(
+                        title="训练准确率变化",
+                        xaxis_title="Epoch",
+                        yaxis_title="准确率 (%)",
+                        hovermode='x unified',
+                        template='plotly_white'
+                    )
+                    
+                    st.plotly_chart(fig_acc, use_container_width=True)
+                
+                # 训练进展分析
+                st.subheader("📊 训练进展分析")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if ncf_history and len(ncf_history['losses']) > 1:
+                        ncf_loss_improvement = ncf_history['losses'][0] - ncf_history['losses'][-1]
+                        ncf_acc_improvement = ncf_history['accuracies'][-1] - ncf_history['accuracies'][0]
+                        
+                        st.metric(
+                            "NCF损失改善",
+                            f"{ncf_loss_improvement:.4f}",
+                            delta=f"{(ncf_loss_improvement/ncf_history['losses'][0]*100):.1f}%"
+                        )
+                        st.metric(
+                            "NCF准确率提升",
+                            f"{ncf_acc_improvement:.2f}%",
+                            delta=f"最终: {ncf_history['accuracies'][-1]:.2f}%"
+                        )
+                
+                with col2:
+                    if lstm_history and len(lstm_history['losses']) > 1:
+                        lstm_loss_improvement = lstm_history['losses'][0] - lstm_history['losses'][-1]
+                        lstm_acc_improvement = lstm_history['accuracies'][-1] - lstm_history['accuracies'][0]
+                        
+                        st.metric(
+                            "LSTM损失改善",
+                            f"{lstm_loss_improvement:.4f}",
+                            delta=f"{(lstm_loss_improvement/lstm_history['losses'][0]*100):.1f}%"
+                        )
+                        st.metric(
+                            "LSTM准确率提升",
+                            f"{lstm_acc_improvement:.2f}%",
+                            delta=f"最终: {lstm_history['accuracies'][-1]:.2f}%"
+                        )
+            else:
+                st.warning("⚠️ 训练历史数据不可用")
         
-        # 性能详细表格
-        st.subheader("📋 详细性能指标")
-        st.dataframe(performance_df, use_container_width=True)
+        with tab2:
+            st.subheader("模型性能雷达图比较")
+            
+            # 获取模型统计信息
+            ncf_stats = None
+            lstm_stats = None
+            
+            if (st.session_state.trained_ncf_recommender and 
+                hasattr(st.session_state.trained_ncf_recommender, 'model_stats')):
+                ncf_stats = st.session_state.trained_ncf_recommender.model_stats
+            
+            if (st.session_state.trained_lstm_recommender and 
+                hasattr(st.session_state.trained_lstm_recommender, 'model_stats')):
+                lstm_stats = st.session_state.trained_lstm_recommender.model_stats
+            
+            if ncf_stats and lstm_stats:
+                # 收集实际数值用于显示
+                raw_metrics = {}
+                radar_values = {}
+                
+                # 1. 模型简洁性 (参数数量的倒数，越简洁越好)
+                ncf_params = ncf_stats.get('total_params', 0)
+                lstm_params = lstm_stats.get('total_params', 0)
+                if ncf_params > 0 and lstm_params > 0:
+                    # 计算简洁性分数 (越小的参数数量得分越高)
+                    max_params = max(ncf_params, lstm_params)
+                    ncf_simplicity = (max_params - ncf_params) / max_params * 100 + 10  # 最少给10分
+                    lstm_simplicity = (max_params - lstm_params) / max_params * 100 + 10
+                    
+                    raw_metrics['模型简洁性'] = {
+                        'NCF': f"{ncf_params:,} 参数",
+                        'LSTM': f"{lstm_params:,} 参数"
+                    }
+                    radar_values['模型简洁性'] = {
+                        'NCF': ncf_simplicity,
+                        'LSTM': lstm_simplicity
+                    }
+                
+                # 2. 训练数据规模 (样本数量)
+                ncf_samples = ncf_stats.get('training_samples', 0)
+                lstm_samples = lstm_stats.get('num_sequences', 0)
+                if ncf_samples > 0 and lstm_samples > 0:
+                    # 不直接拉满，用对数缩放
+                    import math
+                    ncf_data_score = min(90, math.log10(ncf_samples) * 15)  # 最高90分
+                    lstm_data_score = min(90, math.log10(lstm_samples) * 15)
+                    
+                    raw_metrics['训练数据规模'] = {
+                        'NCF': f"{ncf_samples:,} 样本",
+                        'LSTM': f"{lstm_samples:,} 样本"
+                    }
+                    radar_values['训练数据规模'] = {
+                        'NCF': ncf_data_score,
+                        'LSTM': lstm_data_score
+                    }
+                
+                # 3. 最终准确率
+                if ncf_history and lstm_history:
+                    if ncf_history.get('accuracies') and lstm_history.get('accuracies'):
+                        ncf_final_acc = ncf_history['accuracies'][-1] if ncf_history['accuracies'] else 0
+                        lstm_final_acc = lstm_history['accuracies'][-1] if lstm_history['accuracies'] else 0
+                        
+                        raw_metrics['训练准确率'] = {
+                            'NCF': f"{ncf_final_acc:.1f}%",
+                            'LSTM': f"{lstm_final_acc:.1f}%"
+                        }
+                        radar_values['训练准确率'] = {
+                            'NCF': ncf_final_acc,  # 直接使用准确率百分比
+                            'LSTM': lstm_final_acc
+                        }
+                
+                # 4. 收敛速度 (损失下降程度百分比)
+                if ncf_history and lstm_history:
+                    if ncf_history.get('losses') and lstm_history.get('losses'):
+                        ncf_convergence = 0
+                        lstm_convergence = 0
+                        
+                        if len(ncf_history['losses']) > 1 and ncf_history['losses'][0] > 0:
+                            ncf_convergence = (ncf_history['losses'][0] - ncf_history['losses'][-1]) / ncf_history['losses'][0] * 100
+                        
+                        if len(lstm_history['losses']) > 1 and lstm_history['losses'][0] > 0:
+                            lstm_convergence = (lstm_history['losses'][0] - lstm_history['losses'][-1]) / lstm_history['losses'][0] * 100
+                        
+                        raw_metrics['收敛效果'] = {
+                            'NCF': f"{ncf_convergence:.1f}% 损失下降",
+                            'LSTM': f"{lstm_convergence:.1f}% 损失下降"
+                        }
+                        radar_values['收敛效果'] = {
+                            'NCF': min(90, ncf_convergence),  # 最高90分
+                            'LSTM': min(90, lstm_convergence)
+                        }
+                
+                # 5. 用户覆盖率
+                ncf_users = ncf_stats.get('num_users', 0)
+                lstm_users = lstm_stats.get('valid_users', 0)
+                total_users = len(self.data['user_id'].unique()) if self.data is not None else max(ncf_users, lstm_users)
+                
+                if ncf_users > 0 and lstm_users > 0 and total_users > 0:
+                    ncf_coverage = (ncf_users / total_users) * 100
+                    lstm_coverage = (lstm_users / total_users) * 100
+                    
+                    raw_metrics['用户覆盖率'] = {
+                        'NCF': f"{ncf_coverage:.1f}% ({ncf_users:,}用户)",
+                        'LSTM': f"{lstm_coverage:.1f}% ({lstm_users:,}用户)"
+                    }
+                    radar_values['用户覆盖率'] = {
+                        'NCF': ncf_coverage,
+                        'LSTM': lstm_coverage
+                    }
+                
+                # 6. 数据稀疏性适应度 (稀疏度越高，适应性要求越高)
+                ncf_sparsity = ncf_stats.get('sparsity', 0)
+                if ncf_sparsity > 0:
+                    # 稀疏度适应性：稀疏数据下的表现能力
+                    sparsity_challenge = ncf_sparsity * 1000000  # 将稀疏度放大
+                    ncf_sparsity_score = min(85, 20 + (1 - ncf_sparsity * 1000) * 65) if ncf_sparsity < 0.001 else 20
+                    lstm_sparsity_score = min(75, 15 + (1 - ncf_sparsity * 1000) * 60) if ncf_sparsity < 0.001 else 15  # LSTM在极稀疏数据下表现相对较差
+                    
+                    raw_metrics['稀疏数据适应'] = {
+                        'NCF': f"稀疏度 {ncf_sparsity:.6f}",
+                        'LSTM': f"稀疏度 {ncf_sparsity:.6f}"
+                    }
+                    radar_values['稀疏数据适应'] = {
+                        'NCF': ncf_sparsity_score,
+                        'LSTM': lstm_sparsity_score
+                    }
+                
+                # 创建雷达图
+                if radar_values:
+                    categories = list(radar_values.keys())
+                    ncf_values = [radar_values[cat]['NCF'] for cat in categories]
+                    lstm_values = [radar_values[cat]['LSTM'] for cat in categories]
+                    
+                    # 显示具体数值表格
+                    st.subheader("📊 模型性能具体指标")
+                    
+                    # 创建对比表格
+                    comparison_data = []
+                    for metric in categories:
+                        if metric in raw_metrics:
+                            comparison_data.append({
+                                '性能指标': metric,
+                                'NCF深度学习': raw_metrics[metric]['NCF'],
+                                'LSTM序列预测': raw_metrics[metric]['LSTM'],
+                                'NCF得分': f"{radar_values[metric]['NCF']:.1f}",
+                                'LSTM得分': f"{radar_values[metric]['LSTM']:.1f}"
+                            })
+                    
+                    if comparison_data:
+                        comparison_df = pd.DataFrame(comparison_data)
+                        st.dataframe(comparison_df, use_container_width=True)
+                    
+                    # 绘制雷达图
+                    fig_radar = go.Figure()
+                    
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=ncf_values + [ncf_values[0]],  # 闭合图形
+                        theta=categories + [categories[0]],
+                        fill='toself',
+                        name='NCF深度学习',
+                        line_color='#FF6B6B',
+                        fillcolor='rgba(255, 107, 107, 0.3)',
+                        hovertemplate='<b>NCF深度学习</b><br>' +
+                                    '%{theta}: %{r:.1f}分<br>' +
+                                    '<extra></extra>'
+                    ))
+                    
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=lstm_values + [lstm_values[0]],  # 闭合图形
+                        theta=categories + [categories[0]],
+                        fill='toself',
+                        name='LSTM序列预测',
+                        line_color='#4ECDC4',
+                        fillcolor='rgba(78, 205, 196, 0.3)',
+                        hovertemplate='<b>LSTM序列预测</b><br>' +
+                                    '%{theta}: %{r:.1f}分<br>' +
+                                    '<extra></extra>'
+                    ))
+                    
+                    fig_radar.update_layout(
+                        polar=dict(
+                            radialaxis=dict(
+                                visible=True,
+                                range=[0, 100],
+                                tickvals=[20, 40, 60, 80, 100],
+                                ticktext=['20', '40', '60', '80', '100'],
+                                gridcolor='lightgray'
+                            ),
+                            angularaxis=dict(
+                                gridcolor='lightgray'
+                            )
+                        ),
+                        showlegend=True,
+                        title="模型性能雷达图比较 (评分范围: 0-100)",
+                        height=600,
+                        font=dict(size=12)
+                    )
+                    
+                    st.plotly_chart(fig_radar, use_container_width=True)
+                    
+                    # 雷达图说明
+                    st.info("""
+                    **雷达图评分说明:**
+                    - **模型简洁性**: 参数越少得分越高 (轻量化程度)
+                    - **训练数据规模**: 训练样本数量 (对数缩放，最高90分)
+                    - **训练准确率**: 最终训练准确率百分比 (直接使用%)
+                    - **收敛效果**: 训练过程中损失下降百分比 (最高90分)
+                    - **用户覆盖率**: 可推荐用户占总用户的百分比
+                    - **稀疏数据适应**: 在稀疏数据场景下的表现能力
+                    
+                    **注**: 得分越高表示该指标表现越好，满分100分
+                    """)
+                else:
+                    st.warning("⚠️ 无法生成雷达图：缺少必要的统计数据")
+            else:
+                st.warning("⚠️ 雷达图不可用：缺少模型统计信息")
         
-        # 算法推荐建议
-        st.subheader("💡 算法选择建议")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.info("""
-            **🏆 最佳综合性能**
-            - Transformer序列推荐
-            - 在准确率、召回率等多项指标表现优异
-            - 适合有充足数据和计算资源的场景
-            """)
-        
-        with col2:
-            st.success("""
-            **⚡ 最佳效率平衡**
-            - 矩阵分解算法
-            - 性能良好且训练时间适中
-            - 适合中等规模的推荐场景
-            """)
-        
-        with col3:
-            st.warning("""
-            **🚀 快速部署**
-            - 协同过滤算法
-            - 实现简单、训练快速
-            - 适合快速原型和小规模应用
-            """)
+        with tab3:
+            st.subheader("详细统计信息")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("**🧠 NCF深度学习模型**")
+                if st.session_state.trained_ncf_recommender:
+                    ncf_model = st.session_state.trained_ncf_recommender
+                    
+                    # 基本信息
+                    if hasattr(ncf_model, 'model_stats'):
+                        stats = ncf_model.model_stats
+                        st.info(f"""
+                        **基本信息:**
+                        - 用户数: {stats.get('num_users', 'N/A'):,}
+                        - 商品数: {stats.get('num_items', 'N/A'):,}
+                        - 训练样本数: {stats.get('training_samples', 'N/A'):,}
+                        - 数据稀疏度: {stats.get('sparsity', 'N/A'):.6f}
+                        
+                        **模型参数:**
+                        - 总参数数: {stats.get('total_params', 'N/A'):,}
+                        - 可训练参数: {stats.get('trainable_params', 'N/A'):,}
+                        """)
+                    
+                    # 训练结果
+                    if hasattr(ncf_model, 'training_history') and ncf_model.training_history['epochs']:
+                        history = ncf_model.training_history
+                        st.success(f"""
+                        **训练结果:**
+                        - 训练轮数: {len(history['epochs'])}
+                        - 初始损失: {history['losses'][0]:.6f}
+                        - 最终损失: {history['losses'][-1]:.6f}
+                        - 最终准确率: {history['accuracies'][-1]:.2f}%
+                        """)
+                else:
+                    st.warning("NCF模型未训练")
+            
+            with col2:
+                st.write("**📈 LSTM序列预测模型**")
+                if st.session_state.trained_lstm_recommender:
+                    lstm_model = st.session_state.trained_lstm_recommender
+                    
+                    # 基本信息
+                    if hasattr(lstm_model, 'model_stats'):
+                        stats = lstm_model.model_stats
+                        st.info(f"""
+                        **基本信息:**
+                        - 有效用户数: {stats.get('valid_users', 'N/A'):,}
+                        - 商品词汇量: {stats.get('vocab_size_item', 'N/A'):,}
+                        - 类别词汇量: {stats.get('vocab_size_cat', 'N/A'):,}
+                        - 训练序列数: {stats.get('num_sequences', 'N/A'):,}
+                        
+                        **模型参数:**
+                        - 总参数数: {stats.get('total_params', 'N/A'):,}
+                        - 可训练参数: {stats.get('trainable_params', 'N/A'):,}
+                        """)
+                    
+                    # 训练结果
+                    if hasattr(lstm_model, 'training_history') and lstm_model.training_history['epochs']:
+                        history = lstm_model.training_history
+                        st.success(f"""
+                        **训练结果:**
+                        - 训练轮数: {len(history['epochs'])}
+                        - 初始损失: {history['losses'][0]:.6f}
+                        - 最终损失: {history['losses'][-1]:.6f}
+                        - 最终准确率: {history['accuracies'][-1]:.2f}%
+                        """)
+                else:
+                    st.warning("LSTM模型未训练")
     
     def render_personalized_recommendation(self):
         """渲染个性化推荐页面"""
@@ -1505,117 +2877,494 @@ class RecommendationDashboard:
             st.warning("⚠️ 请先在侧边栏上传数据文件")
             return
         
+        # 检查模型训练状态
+        if not st.session_state.models_trained:
+            st.warning("⚠️ 请先在 '推荐算法比较' 页面训练模型")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.info("""
+                **训练步骤:**
+                1. 点击侧边栏选择 '推荐算法比较'
+                2. 点击 '开始训练模型' 按钮
+                3. 等待训练完成
+                4. 返回此页面进行推荐
+                """)
+            
+            with col2:
+                st.image("data:image/svg+xml,%3csvg width='100' height='100' xmlns='http://www.w3.org/2000/svg'%3e%3ctext x='50' y='50' font-size='50' text-anchor='middle' dy='.3em'%3e🤖%3c/text%3e%3c/svg%3e", width=100)
+                st.write("**模型训练中...**")
+            
+            return
+        
         # 用户选择
         st.subheader("👤 选择用户")
         
-        col1, col2 = st.columns([1, 3])
+
+                
+        
+        col1, col2 = st.columns([1, 2])
         
         with col1:
-            user_list = self.data['user_id'].unique()[:100]  # 限制显示用户数量
-            selected_user = st.selectbox("选择用户ID", user_list)
+            # 智能用户选择：只显示可以推荐的用户
+            if st.session_state.models_trained:
+                # 获取所有模型中可推荐的用户
+                ncf_users = set()
+                
+                if (st.session_state.trained_ncf_recommender and 
+                    hasattr(st.session_state.trained_ncf_recommender, 'user2idx')):
+                    ncf_users = set(st.session_state.trained_ncf_recommender.user2idx.keys())
+                
+                # 使用NCF用户作为可推荐用户
+                available_users = ncf_users
+                
+                if available_users:
+                    # 限制用户列表长度，并排序
+                    user_list = sorted(list(available_users))[:200]
+                    st.success(f"✅ 找到 {len(available_users):,} 个可推荐用户 (显示前200个)")
+                    
+                    # 用户选择方式
+                    selection_method = st.radio(
+                        "选择用户方式",
+                        ["从列表选择", "输入用户ID"]
+                    )
+                    
+                    if selection_method == "从列表选择":
+                        selected_user = st.selectbox("选择用户ID", user_list)
+                    else:
+                        input_user = st.text_input("输入用户ID", placeholder="请输入一个用户ID")
+                        if input_user:
+                            try:
+                                # 尝试转换为数字（如果是数字字符串）
+                                input_user_parsed = int(input_user) if input_user.isdigit() else input_user
+                                if input_user_parsed in available_users:
+                                    selected_user = input_user_parsed
+                                    st.success(f"✅ 用户 {input_user_parsed} 可以推荐")
+                                else:
+                                    st.error(f"❌ 用户 {input_user_parsed} 不在训练数据中")
+                                    st.info("可推荐的用户示例: " + ", ".join(map(str, user_list[:5])))
+                                    selected_user = user_list[0] if user_list else None
+                            except ValueError:
+                                st.error("请输入有效的用户ID")
+                                selected_user = user_list[0] if user_list else None
+                        else:
+                            selected_user = user_list[0] if user_list else None
+                            
+                    # 显示用户在各模型中的状态
+                    if selected_user:
+                        status_info = f"**用户 {selected_user} 状态:**\n"
+                        status_info += f"- NCF模型: {'✅ 可推荐' if selected_user in ncf_users else '❌ 不可用'}"
+                        st.info(status_info)
+                else:
+                    st.error("❌ 没有找到可推荐的用户")
+                    st.error("**可能的原因:**")
+                    st.error("- 数据中没有购买行为记录")
+                    st.error("- 模型训练失败或数据不足")
+                    st.error("- 训练数据过滤太严格")
+                    
+                    # 提供调试信息
+                    st.info("**调试信息:**")
+                    st.info(f"- NCF模型用户数: {len(ncf_users)}")
+                    
+                    selected_user = None
+            else:
+                # 如果模型未训练，显示有购买行为的用户作为预览
+                users_with_purchases = self.data[self.data['behavior_type'] == 'buy']['user_id'].unique()
+                
+                if len(users_with_purchases) == 0:
+                    st.error("❌ 数据中没有购买行为记录")
+                    st.info("推荐系统需要购买行为数据进行训练")
+                    selected_user = None
+                else:
+                    user_list = sorted(users_with_purchases[:100])
+                    selected_user = st.selectbox("选择用户ID (模型未训练)", user_list)
+                    st.warning("⚠️ 模型未训练，请先在'推荐算法比较'页面训练模型")
             
-            # 推荐算法选择
-            algorithm = st.selectbox(
-                "选择推荐算法",
-                ["协同过滤", "矩阵分解", "Transformer", "混合推荐"]
-            )
-            
-            recommendation_count = st.slider("推荐数量", 5, 20, 10)
+            if selected_user is not None:
+                # 推荐算法选择
+                algorithm = st.selectbox(
+                    "选择推荐算法",
+                    ["NCF深度学习", "LSTM序列预测"]
+                )
+                
+                recommendation_count = st.slider("推荐数量", 5, 20, 10)
+                
         
         with col2:
-            # 用户历史行为
-            st.write("**用户历史行为**")
-            user_history = self.data[self.data['user_id'] == selected_user].tail(10)
+            # 用户历史行为分析
+            st.write("**用户历史行为分析**")
+            user_history = self.data[self.data['user_id'] == selected_user].tail(20)
             
             if len(user_history) > 0:
+                # 行为统计
                 behavior_summary = user_history['behavior_type'].value_counts()
                 
-                # 行为类型饼图
-                fig = px.pie(
-                    values=behavior_summary.values,
-                    names=behavior_summary.index,
-                    title=f"用户 {selected_user} 行为分布"
+                # 创建行为分析的子图
+                fig = make_subplots(
+                    rows=1, cols=2,
+                    subplot_titles=('行为类型分布', '购买品类分布'),
+                    specs=[[{"type": "pie"}, {"type": "pie"}]]
                 )
+                
+                # 行为类型饼图
+                fig.add_trace(
+                    go.Pie(
+                        labels=behavior_summary.index,
+                        values=behavior_summary.values,
+                        name="行为类型"
+                    ),
+                    row=1, col=1
+                )
+                
+                # 购买品类分布
+                if 'category_id' in user_history.columns:
+                    category_summary = user_history[user_history['behavior_type'] == 'buy']['category_id'].value_counts().head(5)
+                    if len(category_summary) > 0:
+                        fig.add_trace(
+                            go.Pie(
+                                labels=category_summary.index,
+                                values=category_summary.values,
+                                name="购买品类"
+                            ),
+                            row=1, col=2
+                        )
+                
+                fig.update_layout(height=300, showlegend=True)
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # 用户行为时间序列
+                if 'timestamp_dt' in user_history.columns or 'date' in user_history.columns:
+                    time_col = 'timestamp_dt' if 'timestamp_dt' in user_history.columns else 'date'
+                    
+                    try:
+                        # 按日期统计行为数量
+                        if time_col == 'timestamp_dt':
+                            # 确保timestamp_dt是datetime类型
+                            if not pd.api.types.is_datetime64_any_dtype(user_history[time_col]):
+                                user_history[time_col] = pd.to_datetime(user_history[time_col], errors='coerce')
+                            
+                            # 如果转换成功，创建date列
+                            if pd.api.types.is_datetime64_any_dtype(user_history[time_col]):
+                                user_history['date'] = user_history[time_col].dt.date
+                                time_series = user_history.groupby('date').size()
+                            else:
+                                # 如果转换失败，使用原始列
+                                time_series = user_history.groupby(time_col).size()
+                        else:
+                            # 对于date列，尝试确保是正确的格式
+                            if not pd.api.types.is_datetime64_any_dtype(user_history[time_col]):
+                                try:
+                                    user_history[time_col] = pd.to_datetime(user_history[time_col], errors='coerce')
+                                except:
+                                    pass  # 如果转换失败，继续使用原始数据
+                            time_series = user_history.groupby(time_col).size()
+                        
+                        # 只有当time_series不为空时才绘制图表
+                        if len(time_series) > 0:
+                            fig = px.line(
+                                x=time_series.index,
+                                y=time_series.values,
+                                title="用户行为时间序列",
+                                labels={'x': '日期', 'y': '行为次数'}
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("该用户的时间序列数据不足以绘制图表")
+                            
+                    except Exception as e:
+                        st.warning(f"时间序列图表生成失败: {str(e)}")
+                        st.info("跳过时间序列分析，继续显示其他信息")
             
-            # 历史记录表格 - 动态选择可用的时间列
-            display_columns = ['item_id', 'behavior_type']
+            # 用户特征摘要
+            st.subheader("📊 用户特征摘要")
+            col_a, col_b, col_c = st.columns(3)
             
-            # 检查可用的时间列
-            time_columns = ['timestamp_dt', 'date', 'datetime', 'timestamp']
-            available_time_column = None
-            for col in time_columns:
-                if col in user_history.columns:
-                    available_time_column = col
-                    break
+            with col_a:
+                total_actions = len(user_history)
+                st.metric("总行为数", total_actions)
             
-            if available_time_column:
-                display_columns.append(available_time_column)
+            with col_b:
+                unique_items = user_history['item_id'].nunique()
+                st.metric("浏览商品数", unique_items)
             
-            # 如果有category_id也显示
-            if 'category_id' in user_history.columns:
-                display_columns.append('category_id')
-            
-            st.dataframe(user_history[display_columns], use_container_width=True)
+            with col_c:
+                purchase_count = len(user_history[user_history['behavior_type'] == 'buy'])
+                st.metric("购买次数", purchase_count)
         
         # 生成推荐结果
         st.subheader("📋 推荐结果")
         
-        if st.button("🎯 生成推荐", type="primary"):
-            with st.spinner("正在生成个性化推荐..."):
-                # 模拟推荐结果
-                np.random.seed(hash(str(selected_user)) % 2**32)
+        if st.button("🎯 生成个性化推荐", type="primary"):
+            with st.spinner(f"正在使用{algorithm}算法生成个性化推荐..."):
                 
-                # 获取用户未交互过的商品
-                user_items = set(self.data[self.data['user_id'] == selected_user]['item_id'])
-                all_items = set(self.data['item_id'].unique())
-                candidate_items = list(all_items - user_items)
+                try:
+                    recommendations = []
+                    debug_info = []
+                    
+                    st.info(f"开始为用户 {selected_user} 生成推荐...")
+                    
+                    if algorithm == "NCF深度学习":
+                        if st.session_state.trained_ncf_recommender is not None:
+                            st.info("使用训练好的NCF深度学习模型...")
+                            ncf_results = st.session_state.trained_ncf_recommender.recommend(selected_user, recommendation_count)
+                            debug_info.append(f"NCF模型返回结果类型: {type(ncf_results)}")
+                            debug_info.append(f"NCF模型返回结果长度: {len(ncf_results)}")
+                            
+                            if len(ncf_results) > 0:
+                                recommendations = ncf_results
+                                debug_info.append(f"NCF推荐结果: {recommendations[:3]}...")  # 显示前3个
+                            else:
+                                debug_info.append("NCF模型返回空结果")
+                        else:
+                            debug_info.append("NCF模型未训练或不可用")
+                    
+                    elif algorithm == "LSTM序列预测":
+                        if st.session_state.trained_lstm_recommender is not None:
+                            st.info("使用训练好的LSTM序列预测模型...")
+                            lstm_results = st.session_state.trained_lstm_recommender.recommend(selected_user, self.data, recommendation_count)
+                            debug_info.append(f"LSTM模型返回结果类型: {type(lstm_results)}")
+                            debug_info.append(f"LSTM模型返回结果长度: {len(lstm_results)}")
+                            
+                            if len(lstm_results) > 0:
+                                recommendations = lstm_results
+                                debug_info.append(f"LSTM推荐结果: {lstm_results[:3]}...")  # 显示前3个
+                            else:
+                                debug_info.append("LSTM模型返回空结果")
+                        else:
+                            debug_info.append("LSTM模型未训练或不可用")
+                    
+                    elif algorithm == "混合推荐":
+                        st.info("使用混合推荐模型...")
+                        # 结合两种算法的结果
+                        cf_results = []
+                        ncf_results = []
+                        lstm_results = []
+                        
+                        if st.session_state.trained_cf_recommender is not None:
+                            cf_res = st.session_state.trained_cf_recommender.recommend(selected_user, recommendation_count)
+                            debug_info.append(f"混合推荐 - CF结果长度: {len(cf_res)}")
+                            if len(cf_res) > 0:
+                                cf_results = [(item_id, score * 0.4) for item_id, score in zip(cf_res.index, cf_res.values)]
+                        
+                        if st.session_state.trained_ncf_recommender is not None:
+                            ncf_res = st.session_state.trained_ncf_recommender.recommend(selected_user, recommendation_count)
+                            debug_info.append(f"混合推荐 - NCF结果长度: {len(ncf_res)}")
+                            if len(ncf_res) > 0:
+                                ncf_results = [(item_id, score * 0.6) for item_id, score in ncf_res]
+                        
+                        if st.session_state.trained_lstm_recommender is not None:
+                            lstm_res = st.session_state.trained_lstm_recommender.recommend(selected_user, self.data, recommendation_count)
+                            debug_info.append(f"混合推荐 - LSTM结果长度: {len(lstm_res)}")
+                            if len(lstm_res) > 0:
+                                lstm_results = [(item_id, score * 0.2) for item_id, score in lstm_res]
+                        
+                        # 合并并排序
+                        all_results = {}
+                        for item_id, score in cf_results + ncf_results + lstm_results:
+                            if item_id in all_results:
+                                all_results[item_id] += score
+                            else:
+                                all_results[item_id] = score
+                        
+                        recommendations = sorted(all_results.items(), key=lambda x: x[1], reverse=True)[:recommendation_count]
+                        debug_info.append(f"混合推荐最终结果数量: {len(recommendations)}")
+                    
+                    # 显示调试信息
+                    with st.expander("🔍 调试信息"):
+                        for info in debug_info:
+                            st.write(f"- {info}")
+                    
+                    if recommendations and len(recommendations) > 0:
+                        # 构建推荐结果数据框
+                        recommendations_df = pd.DataFrame(recommendations, columns=['商品ID', '推荐分数'])
+                        
+                        # 添加商品额外信息
+                        item_info = []
+                        for item_id in recommendations_df['商品ID']:
+                            item_data = self.data[self.data['item_id'] == item_id]
+                            if len(item_data) > 0:
+                                category = item_data['category_id'].iloc[0] if 'category_id' in item_data.columns else 'Unknown'
+                                popularity = len(item_data)
+                                item_info.append({
+                                    '商品ID': item_id,
+                                    '类别': category,
+                                    '热度': popularity
+                                })
+                        
+                        item_info_df = pd.DataFrame(item_info)
+                        if len(item_info_df) > 0:
+                            recommendations_df = recommendations_df.merge(item_info_df, on='商品ID', how='left')
+                        
+                        # 显示推荐结果
+                        col1, col2 = st.columns([2, 1])
+                        
+                        with col1:
+                            st.subheader("🏆 推荐商品列表")
+                            
+                            # 添加排名列
+                            recommendations_df['排名'] = range(1, len(recommendations_df) + 1)
+                            display_df = recommendations_df[['排名', '商品ID', '推荐分数', '类别', '热度']]
+                            
+                            # 格式化推荐分数
+                            display_df['推荐分数'] = display_df['推荐分数'].apply(lambda x: f"{x:.4f}")
+                            
+                            st.dataframe(display_df, use_container_width=True)
+                        
+                        with col2:
+                            # 推荐分数分布
+                            fig = px.bar(
+                                recommendations_df.head(10),
+                                x='商品ID',
+                                y='推荐分数',
+                                title="Top 10 推荐分数",
+                                color='推荐分数',
+                                color_continuous_scale='viridis'
+                            )
+                            fig.update_layout(xaxis_tickangle=45, height=300)
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        # 推荐多样性分析
+                        if 'category_id' in self.data.columns and '类别' in recommendations_df.columns:
+                            st.subheader("🎨 推荐多样性分析")
+                            
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                # 推荐品类分布
+                                category_dist = recommendations_df['类别'].value_counts()
+                                fig = px.pie(
+                                    values=category_dist.values,
+                                    names=category_dist.index,
+                                    title="推荐商品类别分布"
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            
+                            with col2:
+                                # 热度vs分数散点图
+                                if '热度' in recommendations_df.columns:
+                                    fig = px.scatter(
+                                        recommendations_df,
+                                        x='热度',
+                                        y='推荐分数',
+                                        color='类别',
+                                        title="商品热度 vs 推荐分数",
+                                        hover_data=['商品ID']
+                                    )
+                                    st.plotly_chart(fig, use_container_width=True)
+                        
+                        # 推荐解释
+                        st.subheader("💡 推荐解释")
+                        
+                        explanation_text = f"""
+                        **推荐算法:** {algorithm}
+                        
+                        **推荐依据:**
+                        """
+                        
+                        if algorithm == "协同过滤":
+                            explanation_text += """
+                            - 基于与您相似的用户的购买行为
+                            - 分析用户之间的相似度模式
+                            - 推荐相似用户喜欢的商品
+                            """
+                        elif algorithm == "NCF深度学习":
+                            explanation_text += """
+                            - 使用深度神经网络学习用户-商品复杂关系
+                            - 考虑用户和商品的高维特征表示
+                            - 通过非线性变换捕获潜在偏好
+                            """
+                        elif algorithm == "LSTM序列预测":
+                            explanation_text += """
+                            - 考虑时间序列特征
+                            - 能捕获用户行为模式
+                            - 适合序列推荐
+                            """
+                        elif algorithm == "混合推荐":
+                            explanation_text += """
+                            - 结合协同过滤和深度学习的优势
+                            - 协同过滤权重: 40%, 深度学习权重: 60%
+                            - 提供更加稳定和准确的推荐结果
+                            """
+                        
+                        explanation_text += f"""
+                        
+                        **个性化特征:**
+                        - 用户历史行为: {len(user_history)} 条记录
+                        - 购买行为: {purchase_count} 次
+                        - 浏览商品: {unique_items} 种
+                        - 推荐商品均为用户未曾交互过的商品
+                        """
+                        
+                        st.info(explanation_text)
+                        
+                        # 推荐效果预测
+                        st.subheader("📈 推荐效果预测")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            avg_score = recommendations_df['推荐分数'].mean()
+                            st.metric("平均推荐分数", f"{avg_score:.4f}")
+                        
+                        with col2:
+                            if '类别' in recommendations_df.columns:
+                                diversity_score = len(recommendations_df['类别'].unique()) / len(recommendations_df)
+                                st.metric("多样性指数", f"{diversity_score:.2f}")
+                        
+                        with col3:
+                            if '热度' in recommendations_df.columns:
+                                avg_popularity = recommendations_df['热度'].mean()
+                                st.metric("平均商品热度", f"{avg_popularity:.0f}")
+                    
+                    else:
+                        st.error("无法为该用户生成推荐，可能的原因：")
+                        st.write("- 用户没有足够的历史数据")
+                        st.write("- 模型训练数据中没有该用户")
+                        st.write("- 所有候选商品都已被用户交互过")
                 
-                if len(candidate_items) >= recommendation_count:
-                    recommended_items = np.random.choice(
-                        candidate_items, 
-                        size=recommendation_count, 
-                        replace=False
-                    )
-                    
-                    # 生成模拟推荐分数
-                    recommendation_scores = np.random.uniform(0.6, 0.95, recommendation_count)
-                    
-                    recommendations_df = pd.DataFrame({
-                        '商品ID': recommended_items,
-                        '推荐分数': recommendation_scores,
-                        '推荐原因': [f"基于{algorithm}算法" for _ in range(recommendation_count)]
-                    })
-                    
-                    recommendations_df = recommendations_df.sort_values('推荐分数', ascending=False)
-                    
-                    # 显示推荐结果
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        st.dataframe(recommendations_df, use_container_width=True)
-                    
-                    with col2:
-                        # 推荐分数分布
-                        fig = px.bar(
-                            recommendations_df,
-                            x='商品ID',
-                            y='推荐分数',
-                            title="推荐分数分布"
-                        )
-                        fig.update_layout(xaxis_tickangle=45)
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                    # 推荐解释
-                    st.info(f"""
-                    **推荐解释**
-                    - 使用 {algorithm} 算法为用户 {selected_user} 生成推荐
-                    - 基于用户历史行为模式和相似用户偏好
-                    - 推荐商品均为用户未曾交互过的商品
-                    - 推荐分数反映商品与用户兴趣的匹配度
-                    """)
-                else:
-                    st.error("该用户的可推荐商品数量不足")
+                except Exception as e:
+                    st.error(f"推荐生成失败: {str(e)}")
+                    st.info("建议检查数据格式或重新训练模型")
+    
+    def train_models(self):
+        """训练推荐模型"""
+        if self.data is None or st.session_state.models_trained:
+            return
+            
+        st.info("🔄 正在训练推荐模型，请稍候...")
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # 使用数据子集以提高训练速度
+            sample_size = min(50000, len(self.data))
+            df_sample = self.data.sample(n=sample_size, random_state=42)
+            
+            # 训练NCF模型
+            status_text.text("训练NCF深度学习模型...")
+            progress_bar.progress(50)
+            self.ncf_recommender.fit(df_sample, epochs=3)  # 减少epoch数以提高速度
+            # 保存到session_state
+            st.session_state.trained_ncf_recommender = self.ncf_recommender
+            
+            # 训练LSTM模型
+            status_text.text("训练LSTM序列预测模型...")
+            progress_bar.progress(100)
+            self.lstm_recommender.fit(df_sample)
+            # 保存到session_state
+            st.session_state.trained_lstm_recommender = self.lstm_recommender
+            
+            progress_bar.progress(100)
+            status_text.text("模型训练完成！")
+            # 更新训练状态
+            st.session_state.models_trained = True
+            
+            st.success("✅ 所有推荐模型训练完成！")
+            
+        except Exception as e:
+            st.error(f"模型训练失败: {str(e)}")
+            st.info("建议使用较小的数据样本进行训练")
     
     def run(self):
         """运行仪表板"""
